@@ -1,0 +1,7 @@
+transformers==4.43.3
+vllm==0.6.1.post2
+trl==0.9.4
+peft==0.10.0
+wandb
+deepspeed
+mpi4py

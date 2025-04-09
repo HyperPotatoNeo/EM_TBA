@@ -1,0 +1,5 @@
+# Taken and modified from https://github.com/mnoukhov/async_rlhf
+save_generations: True
+dataset_name: vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_1706381144
+max_new_tokens: 128
+temperature: 0.010001
