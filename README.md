@@ -4,7 +4,8 @@ This is the official repository for the paper [*Trajectory Balance with Asynchro
 
 Our async RL approach speeds up various LLM post-training pipelines (GSM8K, TL;DR, red-teaming). You can use the code here to reproduce results like the following.
 
-![Screenshot 2025-04-09 at 11 59 00 AM](https://github.com/user-attachments/assets/7befedb9-2d49-4103-8ff5-acf6864f0327)
+![Screenshot 2025-04-09 at 12 40 30 PM](https://github.com/user-attachments/assets/c19e3548-072d-4e2c-b040-4d8e2021a5c2)
+
 
 # Setup
 
