@@ -62,6 +62,7 @@ class OnlineTrainerState(TrainerState):
 
 @dataclass
 class TBAConfigGSM8K(RLOOConfig):
+    beta: float = 0.2
     kl_coef: float = 0.012
     kl_coef_final: float = 0.004
     kl_anneal: bool = True
@@ -440,7 +441,7 @@ class TBATrainerGSM8K(Trainer):
         #### vLLM generation #####
         ##########################
         cids = batch_of_data["cid"].repeat(n_repeats).numpy()
-        queries = batch_of_data["input_ids"].cuda()
+        queries = batch_of_data["q_input_ids"].cuda()
         # TODO: create an arg that sets length of queries
         queries = queries.repeat(n_repeats, 1) 
         response_d = batch_of_data["response_ids"].cuda()
@@ -670,7 +671,8 @@ class TBATrainerGSM8K(Trainer):
             
             (responses, sequence_lengths, advantages, logprobs,
              ref_logprobs, scores, query_responses, context_length,
-             padding_mask, kl, non_score_reward, rlhf_reward) = self.get_batch_from_buffer(args.batch_size)
+             padding_mask, kl, non_score_reward, rlhf_reward,
+             q_query_responses, q_context_length, q_padding_mask) = self.get_batch_from_buffer(args.batch_size)
             
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
             for ppo_epoch_idx in range(args.num_ppo_epochs):
@@ -687,8 +689,10 @@ class TBATrainerGSM8K(Trainer):
                             mb_advantage = advantages[micro_batch_inds]
                             mb_responses = responses[micro_batch_inds]
                             mb_query_responses = query_responses[micro_batch_inds]
+                            mb_q_query_responses = q_query_responses[micro_batch_inds]
                             mb_logprobs = logprobs[micro_batch_inds]
 
+                            # log probs with policy
                             output = forward(model, mb_query_responses, tokenizer.pad_token_id)
                             logits = output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
@@ -698,7 +702,7 @@ class TBATrainerGSM8K(Trainer):
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )
 
-                            # TB
+                            # TB (M step)
                             p_ref_f = ref_logprobs.sum(1)
                             pi_f = new_logprobs.sum(1)
                             log_Z_pred = ((-pi_f + p_ref_f[micro_batch_inds]) + scores[micro_batch_inds]/args.kl_coef).view(args.rloo_k, -1)[:logZ_k_size].mean(0).repeat(args.rloo_k).detach()
@@ -706,7 +710,31 @@ class TBATrainerGSM8K(Trainer):
                             accelerator.backward(tb_loss)
                             optimizer.step()
                             optimizer.zero_grad()
+                            del (
+                                new_logprobs, new_all_logprobs, logits, output
+                            )
+                            pi_f = pi_f.detach()
 
+                            # log probs with q_policy
+                            output = forward(model, mb_q_query_responses, tokenizer.pad_token_id)
+                            logits = output.logits[:, q_context_length - 1 : -1]
+                            logits /= args.temperature + 1e-7
+                            new_all_logprobs = F.log_softmax(logits, dim=-1)
+                            new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
+                            new_logprobs = torch.masked_fill(
+                                new_logprobs, q_padding_mask[micro_batch_inds], INVALID_LOGPROB
+                            )
+
+                            # TB (E step)
+                            q_pi_f = new_logprobs.sum(1)
+                            q_log_Z_pred = ((-q_pi_f + pi_f) + scores[micro_batch_inds]/args.beta).view(args.rloo_k, -1)[:logZ_k_size].mean(0).repeat(args.rloo_k).detach()
+                            q_tb_loss = ((q_log_Z_pred + (q_pi_f - pi_f) - scores[micro_batch_start:micro_batch_end]/args.beta)**2).mean()
+                            accelerator.backward(q_tb_loss)
+                            optimizer.step()
+                            optimizer.zero_grad()
+                            q_kl = (q_pi_f.detach() - pi_f.detach()).mean()
+                            
+                            # Unnecessary stuff being logged
                             new_ratio = (new_logprobs - mb_logprobs).exp()
                             new_logprobs = new_logprobs.sum(1)
                             mb_logprobs = mb_logprobs.sum(1)
@@ -757,6 +785,7 @@ class TBATrainerGSM8K(Trainer):
                 metrics = {}
                 metrics["eps"] = eps
                 metrics["objective/kl"] = self.accelerator.gather(mean_kl).mean().item()
+                metrics["objective/q_kl"] = self.accelerator.gather(q_kl).mean().item()
                 metrics["objective/entropy"] = self.accelerator.gather(mean_entropy).mean().item()
                 metrics["objective/non_score_reward"] = self.accelerator.gather(mean_non_score_reward).mean().item()
                 metrics["objective/rlhf_reward"] = self.accelerator.gather(rlhf_reward).mean().item()
@@ -766,7 +795,9 @@ class TBATrainerGSM8K(Trainer):
                 metrics["loss/policy_avg"] = self.accelerator.gather(pg_loss_stats).mean().item()
                 metrics["loss/value_avg"] = self.accelerator.gather(vf_loss_stats).mean().item()
                 metrics["loss/logZ"] = self.accelerator.gather(log_Z_pred).mean().item()
+                metrics["loss/q_logZ"] = self.accelerator.gather(q_log_Z_pred).mean().item()
                 metrics["loss/tb_loss"] = self.accelerator.gather(tb_loss).mean().item()
+                metrics["loss/q_tb_loss"] = self.accelerator.gather(tb_loss).mean().item()
                 metrics["val/clipfrac_avg"] = self.accelerator.gather(vf_clipfrac_stats).mean().item()
                 metrics["policy/entropy_avg"] = self.accelerator.gather(entropy_stats).mean().item()
                 metrics["val/ratio"] = self.accelerator.gather(ratio_stats).mean().item()
@@ -1015,6 +1046,16 @@ class TBATrainerGSM8K(Trainer):
         response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
         padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
 
+        # Same thing for q_queries and q_query_responses
+        q_queries = self.data_collator([self.train_dataset[i] for i in query_IDs])['q_input_ids'].cuda()
+        q_queries = q_queries.repeat_interleave(args.rloo_k, dim=0, output_size=args.rloo_k*len(query_IDs))
+        q_context_length = q_queries.shape[1]
+        
+        # recompute padding mask and query_responses
+        q_query_responses = torch.cat((q_queries, responses), 1)
+        q_response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
+        q_padding_mask = q_response_idxs > sequence_lengths.unsqueeze(1)
+
         # recompute stats
         kl = logprobs - ref_logprobs
         non_score_reward = (-args.kl_coef * kl).sum(1)
@@ -1024,5 +1065,5 @@ class TBATrainerGSM8K(Trainer):
         return (
                     responses, sequence_lengths, advantages, logprobs, ref_logprobs,
                     scores, query_responses, context_length, padding_mask,
-                    kl, non_score_reward, rlhf_reward
+                    kl, non_score_reward, rlhf_reward, q_query_responses, q_context_length, q_padding_mask
                )

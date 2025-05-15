@@ -26,13 +26,36 @@ def format_and_tokenize(example, tokenizer):
     Format the prompt and tokenize it.
     Also extract the gold answer using the same extraction logic.
     """
-    prompt = f"[MATH TASK] Problem:\n{example['question']}\n\nSolution:\n"
-    tokens = tokenizer(prompt, padding=False, return_attention_mask=True)
+    prompt = f"You are given a math problem, solve it step by step. \n Problem:\n{example['question']}\n\nSolution:\n"
+    messages = [
+    {"role": "user", "content": prompt}
+    ]
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    tokens = tokenizer(text, padding=False, return_attention_mask=True)
     gold = extract_prediction(example["answer"])
+    
+    # Q prompt
+    q_prompt = f"You are given a math problem, and the corresponding ground truth answer. Generate step by step reasoning solution to answer the question, such that it leads to the ground truth.\nProblem:\n{example['question']}\nGround truth answer:\n{gold}\nSolution:\n"
+    messages = [
+    {"role": "user", "content": q_prompt}
+    ]
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    q_tokens = tokenizer(text, padding=False, return_attention_mask=True)
+
     assert gold is not NO_NUMBER_FOUND_NUMBER, FIND_NUMBERS_REGEX.findall(example["answer"].replace(",", ""))
     return {
         "input_ids": tokens["input_ids"],
+        "q_input_ids": q_tokens["input_ids"],
         "attention_mask": tokens["attention_mask"],
+        "q_attention_mask": q_tokens["attention_mask"],
         "lengths": len(tokens["input_ids"]),
         "response_ids": gold,
     }
@@ -43,7 +66,7 @@ def prepare_dataset(dataset, tokenizer):
         lambda ex: format_and_tokenize(ex, tokenizer),
         remove_columns=dataset.column_names,
         num_proc=multiprocessing.cpu_count(),
-        load_from_cache_file=True,
+        load_from_cache_file=False,
     )
 
 def evaluate(model, eval_dataloader, generation_config, tokenizer):
