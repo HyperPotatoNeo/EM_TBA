@@ -119,7 +119,7 @@ def prepare_dataset(dataset, tokenizer):
         lambda ex: format_and_tokenize(ex, tokenizer),
         remove_columns=dataset.column_names,
         num_proc=multiprocessing.cpu_count(),
-        load_from_cache_file=True,
+        load_from_cache_file=False,
     )
 
 def evaluate(model, eval_dataloader, generation_config, tokenizer):
