@@ -6,6 +6,59 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorWithPa
 from torch.utils.data import DataLoader
 from trl.trainer.utils import generate
 
+class CustomDataCollator:
+    """
+    Pads both the main and "q_" inputs along with their attention masks,
+    and returns additional fields unmodified or tensorized.
+    """
+    def __init__(
+        self,
+        tokenizer,
+        padding = 'longest',
+        max_length = None
+    ):
+        self.tokenizer = tokenizer
+        self.padding = padding
+        self.max_length = max_length
+
+    def __call__(self, features):
+        # Prepare lists for padding
+        main_inputs = [
+            {"input_ids": f["input_ids"], "attention_mask": f["attention_mask"]}
+            for f in features
+        ]
+        q_inputs = [
+            {"input_ids": f["q_input_ids"], "attention_mask": f["q_attention_mask"]}
+            for f in features
+        ]
+
+        # Use the tokenizer's pad method
+        batch = self.tokenizer.pad(
+            main_inputs,
+            padding=self.padding,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+        q_batch = self.tokenizer.pad(
+            q_inputs,
+            padding=self.padding,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+
+        # Attach the q_ padded tensors
+        batch["q_input_ids"] = q_batch["input_ids"]
+        batch["q_attention_mask"] = q_batch["attention_mask"]
+
+        # Add the static fields
+        batch["lengths"] = torch.tensor([f["lengths"] for f in features], dtype=torch.long)
+        #batch["response_ids"] = [f["response_ids"] for f in features]
+        batch["response_ids"] = torch.tensor([f["response_ids"] for f in features], dtype=torch.float)
+        if "cid" in features[0]:
+            batch["cid"] = torch.tensor([f["cid"] for f in features], dtype=torch.long)
+
+        return batch
+
 # Regex to find numbers
 FIND_NUMBERS_REGEX = re.compile(r"(?:[+-]?\d+\.\d*|[+-]?\.\d+|[+-]?\d+e[-+]?\d+|[+-]?\d+)")
 NO_NUMBER_FOUND_NUMBER = -999999.222222
@@ -26,13 +79,36 @@ def format_and_tokenize(example, tokenizer):
     Format the prompt and tokenize it.
     Also extract the gold answer using the same extraction logic.
     """
-    prompt = f"[MATH TASK] Problem:\n{example['question']}\n\nSolution:\n"
-    tokens = tokenizer(prompt, padding=False, return_attention_mask=True)
+    prompt = f"You are given a math problem, solve it step by step. \n Problem:\n{example['question']}\n\nSolution:\n"
+    messages = [
+    {"role": "user", "content": prompt}
+    ]
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    tokens = tokenizer(text, padding=False, return_attention_mask=True)
     gold = extract_prediction(example["answer"])
+    
+    # Q prompt
+    q_prompt = f"You are given a math problem, and the corresponding ground truth answer. Generate step by step reasoning solution to answer the question, such that it leads to the ground truth.\nProblem:\n{example['question']}\nGround truth answer:\n{gold}\nSolution:\n"
+    messages = [
+    {"role": "user", "content": q_prompt}
+    ]
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    q_tokens = tokenizer(text, padding=False, return_attention_mask=True)
+
     assert gold is not NO_NUMBER_FOUND_NUMBER, FIND_NUMBERS_REGEX.findall(example["answer"].replace(",", ""))
     return {
         "input_ids": tokens["input_ids"],
+        "q_input_ids": q_tokens["input_ids"],
         "attention_mask": tokens["attention_mask"],
+        "q_attention_mask": q_tokens["attention_mask"],
         "lengths": len(tokens["input_ids"]),
         "response_ids": gold,
     }
